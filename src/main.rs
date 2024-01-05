@@ -27,7 +27,7 @@ type UsbDriver = usb_otg::Driver<'static, embassy_stm32::peripherals::USB_OTG_FS
 
 const MTU: usize = 1514;
 const BUFFER_SIZE_TCP_TO_USART: usize = 500;
-const BUFFER_SIZE_USART_TO_TCP: usize = 500;
+const BUFFER_SIZE_USART_TO_TCP: usize = 200;
 
 #[embassy_executor::task]
 async fn usb_task(mut device: UsbDevice<'static, UsbDriver>) -> ! {
@@ -44,15 +44,23 @@ async fn net_task(stack: &'static Stack<Device<'static, MTU>>) -> ! {
     stack.run().await
 }
 
-static CHANNEL_USART_TO_TCP: Channel<ThreadModeRawMutex, Vec<u8, BUFFER_SIZE_USART_TO_TCP>, 1> = Channel::new();
-static CHANNEL_TCP_TO_USART: Channel<ThreadModeRawMutex, Vec<u8, BUFFER_SIZE_TCP_TO_USART>, 1> = Channel::new();
+static CHANNEL_USART_TO_TCP: Channel<ThreadModeRawMutex, Vec<u8, BUFFER_SIZE_USART_TO_TCP>, 2> =
+    Channel::new();
+static CHANNEL_TCP_TO_USART: Channel<ThreadModeRawMutex, Vec<u8, BUFFER_SIZE_TCP_TO_USART>, 1> =
+    Channel::new();
 
 #[embassy_executor::task]
 async fn usart_reader(mut rx: UartRx<'static, USART3, DMA1_CH1>) {
     loop {
         let mut vec: Vec<u8, BUFFER_SIZE_USART_TO_TCP> = Vec::new();
         vec.resize(BUFFER_SIZE_USART_TO_TCP, 0).unwrap();
-        let len = rx.read_until_idle(&mut vec).await.unwrap();
+        let len = match rx.read_until_idle(&mut vec).await {
+            Ok(len) => len,
+            Err(e) => {
+                error!("Usart read error: {:?}", e);
+                continue;
+            }
+        };
         vec.resize(len, 0).unwrap();
         CHANNEL_USART_TO_TCP.send(vec).await;
     }
@@ -154,12 +162,13 @@ async fn main(spawner: Spawner) {
     let usb = builder.build();
 
     unwrap!(spawner.spawn(usb_task(usb)));
-    // FIX ME: Linux CDC-NCM driver requests usb task to be started before cdc_ncm task 
+    // FIX ME: Linux CDC-NCM driver requests usb task to be started before cdc_ncm task
     Timer::after_millis(1000).await;
 
     info!("Config and spawn ncm task");
     static NET_STATE: StaticCell<NetState<MTU, 4, 4>> = StaticCell::new();
-    let (runner, device) = class.into_embassy_net_device::<MTU, 4, 4>(NET_STATE.init(NetState::new()), our_mac_addr);
+    let (runner, device) =
+        class.into_embassy_net_device::<MTU, 4, 4>(NET_STATE.init(NetState::new()), our_mac_addr);
     unwrap!(spawner.spawn(usb_ncm_task(runner)));
 
     // let config = embassy_net::Config::dhcpv4(Default::default());
@@ -208,34 +217,34 @@ async fn main(spawner: Spawner) {
 
         loop {
             // TCP to USART
-            let mut vec: Vec<u8, BUFFER_SIZE_TCP_TO_USART> = Vec::new();
-            vec.resize(BUFFER_SIZE_TCP_TO_USART, 0).unwrap();
-            if socket.can_recv() {
-                if let Either::First(read_ret) = select(socket.read(&mut vec), Timer::after_millis(10)).await {
-                    match read_ret {
-                        Ok(0) => {
-                            error!("read EOF");
-                            break;
-                        }
-                        Ok(len) => {
-                            vec.resize(len, 0).unwrap();
-                            CHANNEL_TCP_TO_USART.send(vec).await;
-                        }
-                        Err(e) => {
-                            error!("read error: {:?}", e);
-                            break;
-                        }
+            while socket.can_recv() {
+                let mut vec: Vec<u8, BUFFER_SIZE_TCP_TO_USART> = Vec::new();
+                vec.resize(BUFFER_SIZE_TCP_TO_USART, 0).unwrap();
+                match socket.read(&mut vec).await {
+                    Ok(0) => {
+                        error!("read EOF");
+                        break;
+                    }
+                    Ok(len) => {
+                        vec.resize(len, 0).unwrap();
+                        CHANNEL_TCP_TO_USART.send(vec).await;
+                    }
+                    Err(e) => {
+                        error!("read error: {:?}", e);
+                        break;
                     }
                 };
+
+                Timer::after_millis(5).await;
             }
 
             // USART to TCP
             if socket.may_send() {
-                if let Either::First(vec) = select(CHANNEL_USART_TO_TCP.receive(), Timer::after_millis(10)).await {
+                if let Either::First(vec) =
+                    select(CHANNEL_USART_TO_TCP.receive(), Timer::after_millis(10)).await
+                {
                     match socket.write_all(&vec).await {
-                        Ok(()) => {
-                            Timer::after_millis(5).await;
-                        }
+                        Ok(()) => {}
                         Err(e) => {
                             error!("write error: {:?}", e);
                             break;
