@@ -26,6 +26,8 @@ use {defmt_rtt as _, panic_probe as _};
 type UsbDriver = usb_otg::Driver<'static, embassy_stm32::peripherals::USB_OTG_FS>;
 
 const MTU: usize = 1514;
+const BUFFER_SIZE_TCP_TO_USART: usize = 500;
+const BUFFER_SIZE_USART_TO_TCP: usize = 500;
 
 #[embassy_executor::task]
 async fn usb_task(mut device: UsbDevice<'static, UsbDriver>) -> ! {
@@ -42,14 +44,14 @@ async fn net_task(stack: &'static Stack<Device<'static, MTU>>) -> ! {
     stack.run().await
 }
 
-static CHANNEL_USART_TO_TCP: Channel<ThreadModeRawMutex, Vec<u8, 16>, 1> = Channel::new();
-static CHANNEL_TCP_TO_USART: Channel<ThreadModeRawMutex, Vec<u8, 16>, 1> = Channel::new();
+static CHANNEL_USART_TO_TCP: Channel<ThreadModeRawMutex, Vec<u8, BUFFER_SIZE_USART_TO_TCP>, 1> = Channel::new();
+static CHANNEL_TCP_TO_USART: Channel<ThreadModeRawMutex, Vec<u8, BUFFER_SIZE_TCP_TO_USART>, 1> = Channel::new();
 
 #[embassy_executor::task]
 async fn usart_reader(mut rx: UartRx<'static, USART3, DMA1_CH1>) {
     loop {
-        let mut vec: Vec<u8, 16> = Vec::new();
-        vec.resize(16, 0).unwrap();
+        let mut vec: Vec<u8, BUFFER_SIZE_USART_TO_TCP> = Vec::new();
+        vec.resize(BUFFER_SIZE_USART_TO_TCP, 0).unwrap();
         let len = rx.read_until_idle(&mut vec).await.unwrap();
         vec.resize(len, 0).unwrap();
         CHANNEL_USART_TO_TCP.send(vec).await;
@@ -193,12 +195,12 @@ async fn main(spawner: Spawner) {
     let mut tx_buffer = [0; 4096];
     let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
     socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
-    socket.set_keep_alive(Some(embassy_time::Duration::from_secs(1)));
+    socket.set_keep_alive(Some(embassy_time::Duration::from_secs(10)));
 
     loop {
         info!("Listening on TCP:1234...");
         if let Err(e) = socket.accept(1234).await {
-            warn!("accept error: {:?}", e);
+            error!("accept error: {:?}", e);
             continue;
         }
 
@@ -206,35 +208,43 @@ async fn main(spawner: Spawner) {
 
         loop {
             // TCP to USART
-            let mut vec: Vec<u8, 16> = Vec::new();
-            vec.resize(16, 0).unwrap();
-            if let Either::First(read_ret) = select(socket.read(&mut vec), Timer::after_millis(100)).await {
-                match read_ret {
-                    Ok(0) => {
-                        warn!("read EOF");
-                        break;
-                    }
-                    Ok(len) => {
-                        vec.resize(len, 0).unwrap();
-                        CHANNEL_TCP_TO_USART.send(vec).await;
-                    }
-                    Err(e) => {
-                        warn!("read error: {:?}", e);
-                        break;
-                    }
-                }
-            };
-
-            // USART to TCP
-            if let Either::First(vec) = select(CHANNEL_USART_TO_TCP.receive(), Timer::after_millis(100)).await {
-                match socket.write_all(&vec).await {
-                    Ok(()) => {}
-                    Err(e) => {
-                        warn!("write error: {:?}", e);
-                        break;
+            let mut vec: Vec<u8, BUFFER_SIZE_TCP_TO_USART> = Vec::new();
+            vec.resize(BUFFER_SIZE_TCP_TO_USART, 0).unwrap();
+            if socket.can_recv() {
+                if let Either::First(read_ret) = select(socket.read(&mut vec), Timer::after_millis(10)).await {
+                    match read_ret {
+                        Ok(0) => {
+                            error!("read EOF");
+                            break;
+                        }
+                        Ok(len) => {
+                            vec.resize(len, 0).unwrap();
+                            CHANNEL_TCP_TO_USART.send(vec).await;
+                        }
+                        Err(e) => {
+                            error!("read error: {:?}", e);
+                            break;
+                        }
                     }
                 };
             }
+
+            // USART to TCP
+            if socket.may_send() {
+                if let Either::First(vec) = select(CHANNEL_USART_TO_TCP.receive(), Timer::after_millis(10)).await {
+                    match socket.write_all(&vec).await {
+                        Ok(()) => {
+                            Timer::after_millis(5).await;
+                        }
+                        Err(e) => {
+                            error!("write error: {:?}", e);
+                            break;
+                        }
+                    };
+                }
+            }
+
+            Timer::after_millis(5).await;
         }
     }
 }
