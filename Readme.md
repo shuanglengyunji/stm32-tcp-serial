@@ -16,9 +16,12 @@ Target hardware: [STM32F4DISCOVERY](https://www.st.com/en/evaluation-tools/stm32
 
     Note: It is recommended to default to release profile. The debug profile may be oversize to some STM32 targets. 
 
+    ```bash
+    DEFMT_LOG=trace cargo run --release     # more debug prints 
+    DEFMT_LOG=info cargo run --release      # better performance
     ```
-    cargo run --release
-    ```
+
+- 
 
 ## Tips for build on other chips
 
