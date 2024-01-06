@@ -31,16 +31,19 @@ const BUFFER_SIZE_USART_TO_TCP: usize = 200;
 
 #[embassy_executor::task]
 async fn usb_task(mut device: UsbDevice<'static, UsbDriver>) -> ! {
+    info!("Running USB task");
     device.run().await
 }
 
 #[embassy_executor::task]
 async fn usb_ncm_task(class: Runner<'static, UsbDriver, MTU>) -> ! {
+    info!("Running NCM task");
     class.run().await
 }
 
 #[embassy_executor::task]
 async fn net_task(stack: &'static Stack<Device<'static, MTU>>) -> ! {
+    info!("Running NET task");
     stack.run().await
 }
 
@@ -50,7 +53,8 @@ static CHANNEL_TCP_TO_USART: Channel<ThreadModeRawMutex, Vec<u8, BUFFER_SIZE_TCP
     Channel::new();
 
 #[embassy_executor::task]
-async fn usart_reader(mut rx: UartRx<'static, USART3, DMA1_CH1>) {
+async fn usart_reader(mut rx: UartRx<'static, USART3, DMA1_CH1>) -> ! {
+    info!("Running USART READER task");
     loop {
         let mut vec: Vec<u8, BUFFER_SIZE_USART_TO_TCP> = Vec::new();
         vec.resize(BUFFER_SIZE_USART_TO_TCP, 0).unwrap();
@@ -67,10 +71,73 @@ async fn usart_reader(mut rx: UartRx<'static, USART3, DMA1_CH1>) {
 }
 
 #[embassy_executor::task]
-async fn usart_sender(mut tx: UartTx<'static, USART3, DMA1_CH3>) {
+async fn usart_sender(mut tx: UartTx<'static, USART3, DMA1_CH3>) -> ! {
+    info!("Running USART SENDER task");
     loop {
         let vec = CHANNEL_TCP_TO_USART.receive().await;
         tx.write(&vec).await.unwrap();
+    }
+}
+
+#[embassy_executor::task]
+async fn tcp_task(stack: &'static Stack<Device<'static, MTU>>) -> ! {
+    info!("Running TCP task");
+
+    let mut rx_buffer = [0; 4096];
+    let mut tx_buffer = [0; 4096];
+    let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+    socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
+    socket.set_keep_alive(Some(embassy_time::Duration::from_secs(10)));
+
+    loop {
+        info!("Listening on TCP:1234...");
+        if let Err(e) = socket.accept(1234).await {
+            error!("accept error: {:?}", e);
+            continue;
+        }
+
+        info!("Received connection from {:?}", socket.remote_endpoint());
+
+        loop {
+            // TCP to USART
+            while socket.can_recv() {
+                let mut vec: Vec<u8, BUFFER_SIZE_TCP_TO_USART> = Vec::new();
+                vec.resize(BUFFER_SIZE_TCP_TO_USART, 0).unwrap();
+                match socket.read(&mut vec).await {
+                    Ok(0) => {
+                        error!("read EOF");
+                        break;
+                    }
+                    Ok(len) => {
+                        vec.resize(len, 0).unwrap();
+                        CHANNEL_TCP_TO_USART.send(vec).await;
+                    }
+                    Err(e) => {
+                        error!("read error: {:?}", e);
+                        break;
+                    }
+                };
+
+                Timer::after_millis(5).await;
+            }
+
+            // USART to TCP
+            if socket.may_send() {
+                if let Either::First(vec) =
+                    select(CHANNEL_USART_TO_TCP.receive(), Timer::after_millis(10)).await
+                {
+                    match socket.write_all(&vec).await {
+                        Ok(()) => {}
+                        Err(e) => {
+                            error!("write error: {:?}", e);
+                            break;
+                        }
+                    };
+                }
+            }
+
+            Timer::after_millis(5).await;
+        }
     }
 }
 
@@ -198,62 +265,10 @@ async fn main(spawner: Spawner) {
     unwrap!(spawner.spawn(net_task(stack)));
 
     // And now we can use it!
-    info!("Start application!");
-
-    let mut rx_buffer = [0; 4096];
-    let mut tx_buffer = [0; 4096];
-    let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-    socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
-    socket.set_keep_alive(Some(embassy_time::Duration::from_secs(10)));
+    info!("Config and spawn tcp stack");
+    unwrap!(spawner.spawn(tcp_task(stack)));
 
     loop {
-        info!("Listening on TCP:1234...");
-        if let Err(e) = socket.accept(1234).await {
-            error!("accept error: {:?}", e);
-            continue;
-        }
-
-        info!("Received connection from {:?}", socket.remote_endpoint());
-
-        loop {
-            // TCP to USART
-            while socket.can_recv() {
-                let mut vec: Vec<u8, BUFFER_SIZE_TCP_TO_USART> = Vec::new();
-                vec.resize(BUFFER_SIZE_TCP_TO_USART, 0).unwrap();
-                match socket.read(&mut vec).await {
-                    Ok(0) => {
-                        error!("read EOF");
-                        break;
-                    }
-                    Ok(len) => {
-                        vec.resize(len, 0).unwrap();
-                        CHANNEL_TCP_TO_USART.send(vec).await;
-                    }
-                    Err(e) => {
-                        error!("read error: {:?}", e);
-                        break;
-                    }
-                };
-
-                Timer::after_millis(5).await;
-            }
-
-            // USART to TCP
-            if socket.may_send() {
-                if let Either::First(vec) =
-                    select(CHANNEL_USART_TO_TCP.receive(), Timer::after_millis(10)).await
-                {
-                    match socket.write_all(&vec).await {
-                        Ok(()) => {}
-                        Err(e) => {
-                            error!("write error: {:?}", e);
-                            break;
-                        }
-                    };
-                }
-            }
-
-            Timer::after_millis(5).await;
-        }
+        Timer::after_secs(100).await;
     }
 }
